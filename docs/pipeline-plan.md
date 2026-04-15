@@ -20,13 +20,11 @@ From the `cortex-ai-functions` skill references:
 | Use `task_description` in AI_CLASSIFY config | All three AI_CLASSIFY calls include a `task_description` string for context |
 | Use label `description` objects for ambiguous categories | Categories like "Other", "Unknown", "UI/UX" get description objects |
 | Use `:labels[0]::VARCHAR` to extract single label | All AI_CLASSIFY outputs use this pattern |
-| AI_COMPLETE: use named argument syntax | Enrichment DT uses `AI_COMPLETE(model => ..., prompt => ...)` for clarity |
 | Require `SNOWFLAKE.CORTEX_USER` role | Setup SQL includes the GRANT statement |
-| Non-deterministic output warning | Notebook markdown cell notes this |
 
 ### Dynamic Tables + AI Functions Compatibility
 
-The official [Dynamic table limitations](https://docs.snowflake.com/en/user-guide/dynamic-tables-limitations) page does **not** prohibit AI functions. AI functions are non-deterministic, which means Snowflake will use **full refresh mode** (not incremental). This is acceptable for this demo since the dataset is static and refresh frequency is daily.
+Since [Sep 2025](https://docs.snowflake.com/en/release-notes/2025/other/2025-09-11-dynamic-tables-cortex-aisql-support), Snowflake supports Cortex AI functions in **incremental** dynamic table refresh mode. Both DTs use `REFRESH_MODE = INCREMENTAL` so only new/changed rows are processed on subsequent refreshes, significantly reducing AI function costs after the initial load.
 
 ---
 
@@ -86,7 +84,7 @@ COPY INTO RAW_SUPPORT_TICKETS
 
 ## File 2: notebooks/support_ticket_demo.ipynb
 
-**Purpose:** Main demo artifact. Uses a mix of SQL-via-cursor and Python (pandas + matplotlib) to build the pipeline, validate it, and visualize results.
+**Purpose:** Main demo artifact. Uses Snowpark Session and Python (pandas + matplotlib) to build the pipeline, validate it, and visualize results.
 
 ### Cell-by-cell structure
 
@@ -158,8 +156,9 @@ Based on ~2,000 tickets, ~500 tokens avg per ticket, 3 AI_CLASSIFY calls per tic
 - **Input tokens**: ~3M total -> ~4.5 credits
 - **Output tokens**: minimal (label string only)
 
-> Note: AI functions are non-deterministic. The Dynamic Table will use **full refresh mode**
-> (not incremental). This is expected and acceptable for a daily-refresh demo pipeline.
+> Note: Since Sep 2025, Cortex AI functions support **incremental refresh** in Dynamic Tables.
+> With `REFRESH_MODE = INCREMENTAL`, only new/changed rows are processed on subsequent refreshes —
+> significantly reducing cost after the initial load.
 ```
 
 **Cell 5 (code):** Create DT_TICKET_CLASSIFICATION
@@ -169,6 +168,7 @@ cur.execute("""
 CREATE OR REPLACE DYNAMIC TABLE DT_TICKET_CLASSIFICATION
   WAREHOUSE = AI_WH
   TARGET_LAG = '1 day'
+  REFRESH_MODE = INCREMENTAL
 AS
 SELECT
     t.*,
@@ -223,10 +223,10 @@ print("DT_TICKET_CLASSIFICATION created")
 ```markdown
 ## Cost Estimate: AI_COMPLETE
 
-Based on ~2,000 tickets, 3 AI_COMPLETE calls per ticket (mistral-large2):
+Based on ~2,000 tickets, 3 AI_COMPLETE calls per ticket (claude-4-sonnet):
 - **Input tokens**: ~3M -> ~4.5 credits
 - **Output tokens**: ~600K -> ~4.5 credits
-- **Total estimate**: ~9 credits for the enrichment layer
+- **Total estimate**: ~9 credits for initial enrichment (incremental refreshes process only new rows)
 ```
 
 **Cell 7 (code):** Create DT_TICKET_ENRICHMENT
@@ -236,15 +236,16 @@ cur.execute("""
 CREATE OR REPLACE DYNAMIC TABLE DT_TICKET_ENRICHMENT
   WAREHOUSE = AI_WH
   TARGET_LAG = '1 day'
+  REFRESH_MODE = INCREMENTAL
 AS
 SELECT
     c.*,
     AI_COMPLETE(
-        model => 'mistral-large2',
+        model => 'claude-4-sonnet',
         prompt => 'Summarize this support ticket in one sentence:\\n\\n' || c.TICKET_DESCRIPTION
     ) AS SUMMARY_TEXT,
     AI_COMPLETE(
-        model => 'mistral-large2',
+        model => 'claude-4-sonnet',
         prompt => 'Explain briefly why this support ticket was classified as:\\n\\n'
             || 'product_category: ' || c.PRODUCT_CATEGORY || '\\n'
             || 'issue_type: '       || c.ISSUE_TYPE       || '\\n'
@@ -252,7 +253,7 @@ SELECT
             || 'Ticket:\\n' || c.TICKET_DESCRIPTION
     ) AS RATIONALE,
     AI_COMPLETE(
-        model => 'mistral-large2',
+        model => 'claude-4-sonnet',
         prompt => 'Given this support ticket, suggest the next best action for a support manager:\\n\\n'
             || c.TICKET_DESCRIPTION
     ) AS MANAGER_RECOMMENDATION
@@ -410,20 +411,128 @@ for _, row in df_samples.iterrows():
     print(f"Recommendation: {row['MANAGER_RECOMMENDATION']}\n")
 ```
 
+#### Section H: AI-Aggregated Insights (AI_AGG)
+
+**Cell 20 (markdown):**
+
+```markdown
+## AI-Generated Insights: Next Actions
+
+Uses **AI_AGG** to generate the top 3 actionable insights for the **Support Manager** and **Product Manager** by aggregating enriched ticket data directly in Snowflake.
+```
+
+**Cell 21 (code):** Persona-specific AI_AGG insights
+
+Runs two `AI_AGG` calls over `DT_TICKET_ENRICHMENT`, one per persona. Each aggregates a concatenated ticket-context expression (priority, category, issue type, subject, summary) with a persona-tailored constant instruction.
+
+- **Sarah Chen (Support Manager):** Focuses on what's breaking now, upset customers, escalation patterns, recurring issues, and Monday-morning action items.
+- **David Park (Product Manager):** Focuses on feature requests, competitor signals, sprint prioritization evidence (volume, tier, urgency), and cross-module issues.
+
+```python
+ticket_expr = """
+    'Priority: ' || PRIORITY_BUCKET
+    || ' | Category: ' || PRODUCT_CATEGORY
+    || ' | Issue: '    || ISSUE_TYPE
+    || ' | Subject: '  || TICKET_SUBJECT
+    || ' | Summary: '  || SUMMARY_TEXT
+"""
+
+personas = {
+    "Sarah Chen — VP of Customer Support": (
+        "You are Sarah Chen, VP of Customer Support at a B2B SaaS company. "
+        "You manage 12 agents across 3 time zones. Your top priorities are: "
+        "spotting what is breaking right now, identifying which customers are upset, "
+        "reducing escalations, improving first-contact resolution, and catching recurring "
+        "patterns early — not months later in a quarterly deck. "
+        "Analyze the support tickets below and return exactly 3 concise, actionable insights "
+        "ranked by urgency. For each insight include: "
+        "(1) a short title, (2) evidence from the tickets, and (3) a concrete next step "
+        "you would take Monday morning to protect customers this week."
+    ),
+    "David Park — Director of Product": (
+        "You are David Park, Director of Product at a B2B SaaS company. "
+        "You own the roadmap for the Iceberg Billing and Drift User Management modules. "
+        "Your top priorities are: surfacing feature requests buried in tickets, "
+        "detecting competitor mentions, building evidence for sprint prioritization "
+        "(how many customers asked, which tier, how urgent), and spotting cross-module issues. "
+        "Analyze the support tickets below and return exactly 3 concise, actionable insights "
+        "ranked by product impact. For each insight include: "
+        "(1) a short title, (2) evidence from the tickets, and (3) a concrete next step "
+        "you would bring to your next sprint planning meeting."
+    ),
+}
+
+for persona, instruction in personas.items():
+    result = session.sql(f"""
+        SELECT AI_AGG(
+            {ticket_expr},
+            '{instruction}'
+        ) AS top_insights
+        FROM DT_TICKET_ENRICHMENT
+    """).collect()[0]["TOP_INSIGHTS"]
+
+    print(f"{'='*60}")
+    print(f"  {persona}")
+    print(f"{'='*60}")
+    print(result)
+    print()
+```
+
+#### Section I: Cost Monitoring
+
+**Cell 22 (markdown):**
+
+```markdown
+## AI Function Cost Monitoring
+
+Uses `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY` to track credits consumed by AI_CLASSIFY, AI_COMPLETE, and AI_AGG calls. Data has up to 60 min latency; running queries are updated every ~30 min. Re-run this cell after the Dynamic Tables have refreshed.
+```
+
+**Cell 23 (code):** Cost monitoring query
+
+```python
+df_cost = session.sql("""
+    SELECT
+        DATE_TRUNC('day', START_TIME) AS USAGE_DATE,
+        FUNCTION_NAME,
+        MODEL_NAME,
+        SUM(CREDITS) AS TOTAL_CREDITS,
+        COUNT(DISTINCT QUERY_ID) AS QUERY_COUNT
+    FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY
+    WHERE START_TIME >= DATEADD('day', -7, CURRENT_TIMESTAMP())
+    GROUP BY 1, 2, 3
+    ORDER BY USAGE_DATE DESC, TOTAL_CREDITS DESC
+""").to_pandas()
+display(df_cost)
+print(f"\nTotal AI function credits (last 7 days): {df_cost['TOTAL_CREDITS'].sum():.4f}")
+```
+
 ---
 
-## Data Flow
+## Continuous Refresh Pipeline
 
-```mermaid
-flowchart TD
-    CSV["data/support_data.csv"] -->|"01_setup.sql: stage + COPY INTO"| RAW["RAW_SUPPORT_TICKETS"]
-    RAW -->|"Notebook Cell 5: AI_CLASSIFY x3"| DT_CLASS["DT_TICKET_CLASSIFICATION"]
-    DT_CLASS -->|"Notebook Cell 7: AI_COMPLETE x3"| DT_ENRICH["DT_TICKET_ENRICHMENT"]
-    DT_ENRICH -->|"Notebook Cells 9-11"| VALID["Validation: row counts, labels, nulls"]
-    DT_ENRICH -->|"Notebook Cells 13-14"| PM["PM View: category + trends"]
-    DT_ENRICH -->|"Notebook Cells 16-17"| SM["Manager View: priority + P0/P1"]
-    DT_ENRICH -->|"Notebook Cell 19"| SAMPLES["Sample enriched records"]
 ```
+  NEW TICKETS                  DYNAMIC TABLES (auto-refresh, incremental)                INSIGHTS (on demand)
+ ─────────────     ┌──────────────────────────────────────────────────┐     ┌──────────────────────────────┐
+                   │                                                  │     │                              │
+  CSV / App DB     │  DT_TICKET_CLASSIFICATION    DT_TICKET_ENRICHMENT│     │  AI_AGG ─► Support Manager  │
+      │            │     AI_CLASSIFY x3               AI_COMPLETE x3  │     │  AI_AGG ─► Product Manager  │
+      ▼            │          │                           │           │     │  Charts & Validation         │
+ @SUPPORT_STAGE    │          │   new/changed rows        │           │     │                              │
+      │            │          ▼ ─────────────────► ▼      │           │     └──────────────────────────────┘
+      ▼            │                                      │           │                  ▲
+ RAW_SUPPORT  ────►│          only delta rows processed   │           │                  │
+  _TICKETS         │          (saves AI credits)          │──────────────────────────────►│
+                   │                                                  │
+                   └──────────────────────────────────────────────────┘
+
+  ◄── TARGET_LAG = 1 day ── Snowflake detects changes and cascades automatically ──►
+```
+
+**How it stays fresh:**
+1. New tickets land in `RAW_SUPPORT_TICKETS` (via COPY INTO, Snowpipe, or manual load).
+2. Snowflake detects changes and incrementally refreshes each Dynamic Table — only the delta runs through AI functions.
+3. `AI_AGG` and charts always query the latest enriched data on every notebook run.
 
 ---
 
@@ -431,16 +540,17 @@ flowchart TD
 
 | Rule (from pipeline.md / taxonomy.md) | How Met |
 |----------------------------------------|---------|
-| AI_CLASSIFY only for labels | Cell 5 uses AI_CLASSIFY for product_category, issue_type, priority_bucket |
-| AI_COMPLETE only for summaries/insights | Cell 7 uses AI_COMPLETE for summary_text, rationale, manager_recommendation |
+| AI_CLASSIFY only for labels | Cell 4 uses AI_CLASSIFY for product_category, issue_type, priority_bucket |
+| AI_COMPLETE only for per-row summaries/rationales | Cell 6 uses AI_COMPLETE for summary_text, rationale, manager_recommendation |
+| AI_AGG for cross-row aggregation insights | Cell 20 uses AI_AGG to generate persona-specific insights across all tickets |
+| AI_AGG instruction must be a string constant | Each persona gets its own AI_AGG call with a literal instruction (no column refs) |
 | Do not classify same field twice | Each field has exactly one AI_CLASSIFY call |
 | Keep raw data separate from derived | RAW_SUPPORT_TICKETS untouched; derived columns in downstream DTs |
 | Labels within taxonomy | Label arrays match docs/taxonomy.md exactly |
-| Row counts match across stages | Notebook Cell 9 validates |
-| Key fields populated | Notebook Cell 11 checks for NULLs |
-| Spot check sample records | Notebook Cells 10 + 19 |
-| Cost estimate before AI calls (skill) | Markdown cells 4 + 6 show estimates |
+| Row counts match across stages | Cell 8 validates |
+| Key fields populated | Cell 10 checks for NULLs |
+| Spot check sample records | Cells 9 + 18 |
+| Cost estimate before AI calls (skill) | Markdown cells 3 + 5 show estimates |
 | task_description for AI_CLASSIFY (skill) | All 3 AI_CLASSIFY calls include task_description |
 | Label descriptions for ambiguous categories (skill) | All categories use label/description objects |
-| Named args for AI_COMPLETE (skill) | Uses model =>, prompt => syntax |
 | CORTEX_USER role required (skill) | Setup SQL includes GRANT statement |
