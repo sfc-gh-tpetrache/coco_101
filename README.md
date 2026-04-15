@@ -1,4 +1,4 @@
-# SnowCare — Support Ticket Intelligence
+# SnowCare — Support Ticket Intelligence ❤️ Built with CoCo
 
 Classifies, enriches, and aggregates support tickets using Snowflake AI functions (`AI_CLASSIFY`, `AI_COMPLETE`, `AI_AGG`) and Dynamic Tables — turning 16,000 tickets/year into Monday-morning insights for two personas.
 

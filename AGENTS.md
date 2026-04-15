@@ -40,6 +40,8 @@ Preferred commands:
 - Use AI_AGG for aggregating insights across many rows — it handles datasets larger than a single LLM context window and is the recommended function for batch, context-agnostic aggregation (e.g. "top 3 insights across all tickets"). Its instruction argument must be a string constant, not a column reference.
 - Keep raw ticket text unchanged and place derived outputs in separate columns or result sets
 - Keep the demo simple, inspectable, and safe for non-prod data only
+- Estimate credits before running AI calls — use `AI_COUNT_TOKENS` to measure input size; monitor consumption via `SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AI_FUNCTIONS_USAGE_HISTORY`
+- When a session gets long or loopy, save progress in memory and start a fresh session with a handoff summary
 
 # References
 - See `docs/taxonomy.md`
