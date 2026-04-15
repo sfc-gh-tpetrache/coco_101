@@ -133,9 +133,9 @@ Document these rules in AGENTS.md so CoCo follows them automatically.
 
 Since Sep 2025, Snowflake supports AI functions in incremental refresh mode. Only new/changed rows run through AI — this keeps costs proportional to change, not total volume.
 
-### Snowpark Over Connector
+### Snowpark Over Pandas
 
-Use `session.sql(...).collect()` for DDL/DML and `.to_pandas()` for queries that feed charts. Push compute to Snowflake; only pull aggregated results to Python.
+Use Snowpark Session (`session.sql(...)`) instead of `snowflake.connector` + cursor. Push compute to Snowflake with `.collect()` for DDL/DML; only call `.to_pandas()` at the visualization boundary for charts and displays. Avoid pulling full datasets into pandas — let Snowflake do the heavy lifting.
 
 ### Cost Awareness
 
